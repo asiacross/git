@@ -3,12 +3,18 @@
 test_description='various Windows-only path tests'
 . ./test-lib.sh
 
-if ! test_have_prereq MINGW; then
+if test_have_prereq CYGWIN
+then
+	alias winpwd='cygpath -aw .'
+elif test_have_prereq MINGW
+then
+	alias winpwd=pwd
+else
 	skip_all='skipping Windows-only path tests'
 	test_done
 fi
 
-UNCPATH="$(pwd)"
+UNCPATH="$(winpwd)"
 case "$UNCPATH" in
 [A-Z]:*)
 	WITHOUTDRIVE="${UNCPATH#?:}"
@@ -71,9 +77,9 @@ test_expect_success push '
 	test "$rev" = "$(git rev-parse --verify refs/heads/to-push)"
 '
 
-test_expect_success 'remote nick cannot contain backslashes' '
-	BACKSLASHED="$(pwd | tr / \\\\)" &&
-	git ls-remote "$BACKSLASHED" >out 2>err &&
+test_expect_success MINGW 'remote nick cannot contain backslashes' '
+	BACKSLASHED="$(winpwd | tr / \\\\)" &&
+	git ls-remote "$BACKSLASHED" 2>err &&
 	test_i18ngrep ! "unable to access" err
 '
 

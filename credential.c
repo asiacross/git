@@ -5,6 +5,7 @@
 #include "run-command.h"
 #include "url.h"
 #include "prompt.h"
+#include "sigchain.h"
 
 void credential_init(struct credential *c)
 {
@@ -135,9 +136,7 @@ static void credential_getpass(struct credential *c)
 {
 	if (!c->username)
 		c->username = credential_ask_one("Username", c,
-						 (getenv("GIT_ASKPASS") ?
-						  PROMPT_ASKPASS : 0) |
-						 PROMPT_ECHO);
+						 PROMPT_ASKPASS|PROMPT_ECHO);
 	if (!c->password)
 		c->password = credential_ask_one("Password", c,
 						 PROMPT_ASKPASS);
@@ -147,7 +146,7 @@ int credential_read(struct credential *c, FILE *fp)
 {
 	struct strbuf line = STRBUF_INIT;
 
-	while (strbuf_getline_lf(&line, fp) != EOF) {
+	while (strbuf_getline(&line, fp) != EOF) {
 		char *key = line.buf;
 		char *value = strchr(key, '=');
 
@@ -229,8 +228,10 @@ static int run_credential_helper(struct credential *c,
 		return -1;
 
 	fp = xfdopen(helper.in, "w");
+	sigchain_push(SIGPIPE, SIG_IGN);
 	credential_write(c, fp);
 	fclose(fp);
+	sigchain_pop(SIGPIPE);
 
 	if (want_output) {
 		int r;

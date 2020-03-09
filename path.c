@@ -9,7 +9,10 @@
 #include "worktree.h"
 #include "submodule-config.h"
 #include "path.h"
-#include "exec_cmd.h"
+#include "packfile.h"
+#include "object-store.h"
+#include "lockfile.h"
+#include "exec-cmd.h"
 
 static int get_st_mode_bits(const char *path, int *mode)
 {
@@ -34,11 +37,10 @@ static struct strbuf *get_pathname(void)
 	return sb;
 }
 
-static char *cleanup_path(char *path)
+static const char *cleanup_path(const char *path)
 {
 	/* Clean it up */
-	if (!memcmp(path, "./", 2)) {
-		path += 2;
+	if (skip_prefix(path, "./", &path)) {
 		while (*path == '/')
 			path++;
 	}
@@ -47,7 +49,7 @@ static char *cleanup_path(char *path)
 
 static void strbuf_cleanup_path(struct strbuf *sb)
 {
-	char *path = cleanup_path(sb->buf);
+	const char *path = cleanup_path(sb->buf);
 	if (path > sb->buf)
 		strbuf_remove(sb, 0, path - sb->buf);
 }
@@ -64,7 +66,7 @@ char *mksnpath(char *buf, size_t n, const char *fmt, ...)
 		strlcpy(buf, bad_path, n);
 		return buf;
 	}
-	return cleanup_path(buf);
+	return (char *)cleanup_path(buf);
 }
 
 static int dir_prefix(const char *buf, const char *dir)
@@ -101,31 +103,36 @@ struct common_dir {
 	/* Not considered garbage for report_linked_checkout_garbage */
 	unsigned ignore_garbage:1;
 	unsigned is_dir:1;
-	/* Not common even though its parent is */
-	unsigned exclude:1;
-	const char *dirname;
+	/* Belongs to the common dir, though it may contain paths that don't */
+	unsigned is_common:1;
+	const char *path;
 };
 
 static struct common_dir common_list[] = {
-	{ 0, 1, 0, "branches" },
-	{ 0, 1, 0, "hooks" },
-	{ 0, 1, 0, "info" },
-	{ 0, 0, 1, "info/sparse-checkout" },
-	{ 1, 1, 0, "logs" },
-	{ 1, 1, 1, "logs/HEAD" },
-	{ 0, 1, 1, "logs/refs/bisect" },
-	{ 0, 1, 0, "lost-found" },
-	{ 0, 1, 0, "objects" },
-	{ 0, 1, 0, "refs" },
-	{ 0, 1, 1, "refs/bisect" },
-	{ 0, 1, 0, "remotes" },
-	{ 0, 1, 0, "worktrees" },
-	{ 0, 1, 0, "rr-cache" },
-	{ 0, 1, 0, "svn" },
-	{ 0, 0, 0, "config" },
-	{ 1, 0, 0, "gc.pid" },
-	{ 0, 0, 0, "packed-refs" },
-	{ 0, 0, 0, "shallow" },
+	{ 0, 1, 1, "branches" },
+	{ 0, 1, 1, "common" },
+	{ 0, 1, 1, "hooks" },
+	{ 0, 1, 1, "info" },
+	{ 0, 0, 0, "info/sparse-checkout" },
+	{ 1, 1, 1, "logs" },
+	{ 1, 0, 0, "logs/HEAD" },
+	{ 0, 1, 0, "logs/refs/bisect" },
+	{ 0, 1, 0, "logs/refs/rewritten" },
+	{ 0, 1, 0, "logs/refs/worktree" },
+	{ 0, 1, 1, "lost-found" },
+	{ 0, 1, 1, "objects" },
+	{ 0, 1, 1, "refs" },
+	{ 0, 1, 0, "refs/bisect" },
+	{ 0, 1, 0, "refs/rewritten" },
+	{ 0, 1, 0, "refs/worktree" },
+	{ 0, 1, 1, "remotes" },
+	{ 0, 1, 1, "worktrees" },
+	{ 0, 1, 1, "rr-cache" },
+	{ 0, 1, 1, "svn" },
+	{ 0, 0, 1, "config" },
+	{ 1, 0, 1, "gc.pid" },
+	{ 0, 0, 1, "packed-refs" },
+	{ 0, 0, 1, "shallow" },
 	{ 0, 0, 0, NULL }
 };
 
@@ -193,7 +200,7 @@ static void *add_to_trie(struct trie *root, const char *key, void *value)
 		 * Split this node: child will contain this node's
 		 * existing children.
 		 */
-		child = malloc(sizeof(*child));
+		child = xmalloc(sizeof(*child));
 		memcpy(child->children, root->children, sizeof(root->children));
 
 		child->len = root->len - i - 1;
@@ -231,30 +238,41 @@ static void *add_to_trie(struct trie *root, const char *key, void *value)
 	return old;
 }
 
-typedef int (*match_fn)(const char *unmatched, void *data, void *baton);
+typedef int (*match_fn)(const char *unmatched, void *value, void *baton);
 
 /*
  * Search a trie for some key.  Find the longest /-or-\0-terminated
- * prefix of the key for which the trie contains a value.  Call fn
- * with the unmatched portion of the key and the found value, and
- * return its return value.  If there is no such prefix, return -1.
+ * prefix of the key for which the trie contains a value.  If there is
+ * no such prefix, return -1.  Otherwise call fn with the unmatched
+ * portion of the key and the found value.  If fn returns 0 or
+ * positive, then return its return value.  If fn returns negative,
+ * then call fn with the next-longest /-terminated prefix of the key
+ * (i.e. a parent directory) for which the trie contains a value, and
+ * handle its return value the same way.  If there is no shorter
+ * /-terminated prefix with a value left, then return the negative
+ * return value of the most recent fn invocation.
  *
  * The key is partially normalized: consecutive slashes are skipped.
  *
- * For example, consider the trie containing only [refs,
- * refs/worktree] (both with values).
+ * For example, consider the trie containing only [logs,
+ * logs/refs/bisect], both with values, but not logs/refs.
  *
- * | key             | unmatched  | val from node | return value |
- * |-----------------|------------|---------------|--------------|
- * | a               | not called | n/a           | -1           |
- * | refs            | \0         | refs          | as per fn    |
- * | refs/           | /          | refs          | as per fn    |
- * | refs/w          | /w         | refs          | as per fn    |
- * | refs/worktree   | \0         | refs/worktree | as per fn    |
- * | refs/worktree/  | /          | refs/worktree | as per fn    |
- * | refs/worktree/a | /a         | refs/worktree | as per fn    |
- * |-----------------|------------|---------------|--------------|
- *
+ * | key                | unmatched      | prefix to node   | return value |
+ * |--------------------|----------------|------------------|--------------|
+ * | a                  | not called     | n/a              | -1           |
+ * | logstore           | not called     | n/a              | -1           |
+ * | logs               | \0             | logs             | as per fn    |
+ * | logs/              | /              | logs             | as per fn    |
+ * | logs/refs          | /refs          | logs             | as per fn    |
+ * | logs/refs/         | /refs/         | logs             | as per fn    |
+ * | logs/refs/b        | /refs/b        | logs             | as per fn    |
+ * | logs/refs/bisected | /refs/bisected | logs             | as per fn    |
+ * | logs/refs/bisect   | \0             | logs/refs/bisect | as per fn    |
+ * | logs/refs/bisect/  | /              | logs/refs/bisect | as per fn    |
+ * | logs/refs/bisect/a | /a             | logs/refs/bisect | as per fn    |
+ * | (If fn in the previous line returns -1, then fn is called once more:) |
+ * | logs/refs/bisect/a | /refs/bisect/a | logs             | as per fn    |
+ * |--------------------|----------------|------------------|--------------|
  */
 static int trie_find(struct trie *root, const char *key, match_fn fn,
 		     void *baton)
@@ -283,9 +301,13 @@ static int trie_find(struct trie *root, const char *key, match_fn fn,
 
 	/* Matched the entire compressed section */
 	key += i;
-	if (!*key)
+	if (!*key) {
 		/* End of key */
-		return fn(key, root->value, baton);
+		if (root->value)
+			return fn(key, root->value, baton);
+		else
+			return -1;
+	}
 
 	/* Partial path normalization: skip consecutive slashes */
 	while (key[0] == '/' && key[1] == '/')
@@ -315,8 +337,8 @@ static void init_common_trie(void)
 	if (common_trie_done_setup)
 		return;
 
-	for (p = common_list; p->dirname; p++)
-		add_to_trie(&common_trie, p->dirname, p);
+	for (p = common_list; p->path; p++)
+		add_to_trie(&common_trie, p->path, p);
 
 	common_trie_done_setup = 1;
 }
@@ -329,14 +351,11 @@ static int check_common(const char *unmatched, void *value, void *baton)
 {
 	struct common_dir *dir = value;
 
-	if (!dir)
-		return 0;
-
 	if (dir->is_dir && (unmatched[0] == 0 || unmatched[0] == '/'))
-		return !dir->exclude;
+		return dir->is_common;
 
 	if (!dir->is_dir && unmatched[0] == 0)
-		return !dir->exclude;
+		return dir->is_common;
 
 	return 0;
 }
@@ -345,9 +364,14 @@ static void update_common_dir(struct strbuf *buf, int git_dir_len,
 			      const char *common_dir)
 {
 	char *base = buf->buf + git_dir_len;
+	int has_lock_suffix = strbuf_strip_suffix(buf, LOCK_SUFFIX);
+
 	init_common_trie();
 	if (trie_find(&common_trie, base, check_common, NULL) > 0)
 		replace_dir(buf, git_dir_len, common_dir);
+
+	if (has_lock_suffix)
+		strbuf_addstr(buf, LOCK_SUFFIX);
 }
 
 void report_linked_checkout_garbage(void)
@@ -360,8 +384,8 @@ void report_linked_checkout_garbage(void)
 		return;
 	strbuf_addf(&sb, "%s/", get_git_dir());
 	len = sb.len;
-	for (p = common_list; p->dirname; p++) {
-		const char *path = p->dirname;
+	for (p = common_list; p->path; p++) {
+		const char *path = p->path;
 		if (p->ignore_garbage)
 			continue;
 		strbuf_setlen(&sb, len);
@@ -383,7 +407,7 @@ static void adjust_git_path(const struct repository *repo,
 		strbuf_splice(buf, 0, buf->len,
 			      repo->index_file, strlen(repo->index_file));
 	else if (dir_prefix(base, "objects"))
-		replace_dir(buf, git_dir_len + 7, repo->objectdir);
+		replace_dir(buf, git_dir_len + 7, repo->objects->odb->path);
 	else if (git_hooks_path && dir_prefix(base, "hooks"))
 		replace_dir(buf, git_dir_len + 5, git_hooks_path);
 	else if (repo->different_commondir)
@@ -637,8 +661,9 @@ void strbuf_git_common_path(struct strbuf *sb,
 int validate_headref(const char *path)
 {
 	struct stat st;
-	char *buf, buffer[256];
-	unsigned char sha1[20];
+	char buffer[256];
+	const char *refname;
+	struct object_id oid;
 	int fd;
 	ssize_t len;
 
@@ -662,24 +687,24 @@ int validate_headref(const char *path)
 	len = read_in_full(fd, buffer, sizeof(buffer)-1);
 	close(fd);
 
+	if (len < 0)
+		return -1;
+	buffer[len] = '\0';
+
 	/*
 	 * Is it a symbolic ref?
 	 */
-	if (len < 4)
-		return -1;
-	if (!memcmp("ref:", buffer, 4)) {
-		buf = buffer + 4;
-		len -= 4;
-		while (len && isspace(*buf))
-			buf++, len--;
-		if (len >= 5 && !memcmp("refs/", buf, 5))
+	if (skip_prefix(buffer, "ref:", &refname)) {
+		while (isspace(*refname))
+			refname++;
+		if (starts_with(refname, "refs/"))
 			return 0;
 	}
 
 	/*
 	 * Is this a detached HEAD?
 	 */
-	if (!get_sha1_hex(buffer, sha1))
+	if (!get_oid_hex(buffer, &oid))
 		return 0;
 
 	return -1;
@@ -721,7 +746,7 @@ char *expand_user_path(const char *path, int real_home)
 			if (!home)
 				goto return_null;
 			if (real_home)
-				strbuf_addstr(&user_path, real_path(home));
+				strbuf_add_real_path(&user_path, home);
 			else
 				strbuf_addstr(&user_path, home);
 #ifdef GIT_WINDOWS_NATIVE
@@ -1219,31 +1244,91 @@ static inline int chomp_trailing_dir_sep(const char *path, int len)
 }
 
 /*
+ * If path ends with suffix (complete path components), returns the offset of
+ * the last character in the path before the suffix (sans trailing directory
+ * separators), and -1 otherwise.
+ */
+static ssize_t stripped_path_suffix_offset(const char *path, const char *suffix)
+{
+	int path_len = strlen(path), suffix_len = strlen(suffix);
+
+	while (suffix_len) {
+		if (!path_len)
+			return -1;
+
+		if (is_dir_sep(path[path_len - 1])) {
+			if (!is_dir_sep(suffix[suffix_len - 1]))
+				return -1;
+			path_len = chomp_trailing_dir_sep(path, path_len);
+			suffix_len = chomp_trailing_dir_sep(suffix, suffix_len);
+		}
+		else if (path[--path_len] != suffix[--suffix_len])
+			return -1;
+	}
+
+	if (path_len && !is_dir_sep(path[path_len - 1]))
+		return -1;
+	return chomp_trailing_dir_sep(path, path_len);
+}
+
+/*
+ * Returns true if the path ends with components, considering only complete path
+ * components, and false otherwise.
+ */
+int ends_with_path_components(const char *path, const char *components)
+{
+	return stripped_path_suffix_offset(path, components) != -1;
+}
+
+/*
  * If path ends with suffix (complete path components), returns the
  * part before suffix (sans trailing directory separators).
  * Otherwise returns NULL.
  */
 char *strip_path_suffix(const char *path, const char *suffix)
 {
-	int path_len = strlen(path), suffix_len = strlen(suffix);
+	ssize_t offset = stripped_path_suffix_offset(path, suffix);
 
-	while (suffix_len) {
-		if (!path_len)
-			return NULL;
+	return offset == -1 ? NULL : xstrndup(path, offset);
+}
 
-		if (is_dir_sep(path[path_len - 1])) {
-			if (!is_dir_sep(suffix[suffix_len - 1]))
-				return NULL;
-			path_len = chomp_trailing_dir_sep(path, path_len);
-			suffix_len = chomp_trailing_dir_sep(suffix, suffix_len);
-		}
-		else if (path[--path_len] != suffix[--suffix_len])
-			return NULL;
+int is_mount_point_via_stat(struct strbuf *path)
+{
+	size_t len = path->len;
+	unsigned int current_dev;
+	struct stat st;
+
+	if (!strcmp("/", path->buf))
+		return 1;
+
+	strbuf_addstr(path, "/.");
+	if (lstat(path->buf, &st)) {
+		/*
+		 * If we cannot access the current directory, we cannot say
+		 * that it is a bind mount.
+		 */
+		strbuf_setlen(path, len);
+		return 0;
 	}
+	current_dev = st.st_dev;
 
-	if (path_len && !is_dir_sep(path[path_len - 1]))
-		return NULL;
-	return xstrndup(path, chomp_trailing_dir_sep(path, path_len));
+	/* Now look at the parent directory */
+	strbuf_addch(path, '.');
+	if (lstat(path->buf, &st)) {
+		/*
+		 * If we cannot access the parent directory, we cannot say
+		 * that it is a bind mount.
+		 */
+		strbuf_setlen(path, len);
+		return 0;
+	}
+	strbuf_setlen(path, len);
+
+	/*
+	 * If the device ID differs between current and parent directory,
+	 * then it is a bind mount.
+	 */
+	return current_dev != st.st_dev;
 }
 
 int daemon_avoid_alias(const char *p)
@@ -1293,37 +1378,161 @@ int daemon_avoid_alias(const char *p)
 	}
 }
 
-static int only_spaces_and_periods(const char *path, size_t len, size_t skip)
-{
-	if (len < skip)
-		return 0;
-	len -= skip;
-	path += skip;
-	while (len-- > 0) {
-		char c = *(path++);
-		if (c != ' ' && c != '.')
-			return 0;
-	}
-	return 1;
-}
-
+/*
+ * On NTFS, we need to be careful to disallow certain synonyms of the `.git/`
+ * directory:
+ *
+ * - For historical reasons, file names that end in spaces or periods are
+ *   automatically trimmed. Therefore, `.git . . ./` is a valid way to refer
+ *   to `.git/`.
+ *
+ * - For other historical reasons, file names that do not conform to the 8.3
+ *   format (up to eight characters for the basename, three for the file
+ *   extension, certain characters not allowed such as `+`, etc) are associated
+ *   with a so-called "short name", at least on the `C:` drive by default.
+ *   Which means that `git~1/` is a valid way to refer to `.git/`.
+ *
+ *   Note: Technically, `.git/` could receive the short name `git~2` if the
+ *   short name `git~1` were already used. In Git, however, we guarantee that
+ *   `.git` is the first item in a directory, therefore it will be associated
+ *   with the short name `git~1` (unless short names are disabled).
+ *
+ * - For yet other historical reasons, NTFS supports so-called "Alternate Data
+ *   Streams", i.e. metadata associated with a given file, referred to via
+ *   `<filename>:<stream-name>:<stream-type>`. There exists a default stream
+ *   type for directories, allowing `.git/` to be accessed via
+ *   `.git::$INDEX_ALLOCATION/`.
+ *
+ * When this function returns 1, it indicates that the specified file/directory
+ * name refers to a `.git` file or directory, or to any of these synonyms, and
+ * Git should therefore not track it.
+ *
+ * For performance reasons, _all_ Alternate Data Streams of `.git/` are
+ * forbidden, not just `::$INDEX_ALLOCATION`.
+ *
+ * This function is intended to be used by `git fsck` even on platforms where
+ * the backslash is a regular filename character, therefore it needs to handle
+ * backlash characters in the provided `name` specially: they are interpreted
+ * as directory separators.
+ */
 int is_ntfs_dotgit(const char *name)
 {
-	int len;
+	char c;
 
-	for (len = 0; ; len++)
-		if (!name[len] || name[len] == '\\' || is_dir_sep(name[len])) {
-			if (only_spaces_and_periods(name, len, 4) &&
-					!strncasecmp(name, ".git", 4))
+	/*
+	 * Note that when we don't find `.git` or `git~1` we end up with `name`
+	 * advanced partway through the string. That's okay, though, as we
+	 * return immediately in those cases, without looking at `name` any
+	 * further.
+	 */
+	c = *(name++);
+	if (c == '.') {
+		/* .git */
+		if (((c = *(name++)) != 'g' && c != 'G') ||
+		    ((c = *(name++)) != 'i' && c != 'I') ||
+		    ((c = *(name++)) != 't' && c != 'T'))
+			return 0;
+	} else if (c == 'g' || c == 'G') {
+		/* git ~1 */
+		if (((c = *(name++)) != 'i' && c != 'I') ||
+		    ((c = *(name++)) != 't' && c != 'T') ||
+		    *(name++) != '~' ||
+		    *(name++) != '1')
+			return 0;
+	} else
+		return 0;
+
+	for (;;) {
+		c = *(name++);
+		if (!c || c == '\\' || c == '/' || c == ':')
+			return 1;
+		if (c != '.' && c != ' ')
+			return 0;
+	}
+}
+
+static int is_ntfs_dot_generic(const char *name,
+			       const char *dotgit_name,
+			       size_t len,
+			       const char *dotgit_ntfs_shortname_prefix)
+{
+	int saw_tilde;
+	size_t i;
+
+	if ((name[0] == '.' && !strncasecmp(name + 1, dotgit_name, len))) {
+		i = len + 1;
+only_spaces_and_periods:
+		for (;;) {
+			char c = name[i++];
+			if (!c || c == ':')
 				return 1;
-			if (only_spaces_and_periods(name, len, 5) &&
-					!strncasecmp(name, "git~1", 5))
-				return 1;
-			if (name[len] != '\\')
+			if (c != ' ' && c != '.')
 				return 0;
-			name += len + 1;
-			len = -1;
 		}
+	}
+
+	/*
+	 * Is it a regular NTFS short name, i.e. shortened to 6 characters,
+	 * followed by ~1, ... ~4?
+	 */
+	if (!strncasecmp(name, dotgit_name, 6) && name[6] == '~' &&
+	    name[7] >= '1' && name[7] <= '4') {
+		i = 8;
+		goto only_spaces_and_periods;
+	}
+
+	/*
+	 * Is it a fall-back NTFS short name (for details, see
+	 * https://en.wikipedia.org/wiki/8.3_filename?
+	 */
+	for (i = 0, saw_tilde = 0; i < 8; i++)
+		if (name[i] == '\0')
+			return 0;
+		else if (saw_tilde) {
+			if (name[i] < '0' || name[i] > '9')
+				return 0;
+		} else if (name[i] == '~') {
+			if (name[++i] < '1' || name[i] > '9')
+				return 0;
+			saw_tilde = 1;
+		} else if (i >= 6)
+			return 0;
+		else if (name[i] & 0x80) {
+			/*
+			 * We know our needles contain only ASCII, so we clamp
+			 * here to make the results of tolower() sane.
+			 */
+			return 0;
+		} else if (tolower(name[i]) != dotgit_ntfs_shortname_prefix[i])
+			return 0;
+
+	goto only_spaces_and_periods;
+}
+
+/*
+ * Inline helper to make sure compiler resolves strlen() on literals at
+ * compile time.
+ */
+static inline int is_ntfs_dot_str(const char *name, const char *dotgit_name,
+				  const char *dotgit_ntfs_shortname_prefix)
+{
+	return is_ntfs_dot_generic(name, dotgit_name, strlen(dotgit_name),
+				   dotgit_ntfs_shortname_prefix);
+}
+
+int is_ntfs_dotgitmodules(const char *name)
+{
+	return is_ntfs_dot_str(name, "gitmodules", "gi7eba");
+}
+
+int is_ntfs_dotgitignore(const char *name)
+{
+	return is_ntfs_dot_str(name, "gitignore", "gi250a");
+}
+
+int is_ntfs_dotgitattributes(const char *name)
+{
+	return is_ntfs_dot_str(name, "gitattributes", "gi7d29");
 }
 
 int looks_like_command_line_option(const char *str)
@@ -1361,12 +1570,12 @@ char *xdg_cache_home(const char *filename)
 	return NULL;
 }
 
-GIT_PATH_FUNC(git_path_cherry_pick_head, "CHERRY_PICK_HEAD")
-GIT_PATH_FUNC(git_path_revert_head, "REVERT_HEAD")
-GIT_PATH_FUNC(git_path_squash_msg, "SQUASH_MSG")
-GIT_PATH_FUNC(git_path_merge_msg, "MERGE_MSG")
-GIT_PATH_FUNC(git_path_merge_rr, "MERGE_RR")
-GIT_PATH_FUNC(git_path_merge_mode, "MERGE_MODE")
-GIT_PATH_FUNC(git_path_merge_head, "MERGE_HEAD")
-GIT_PATH_FUNC(git_path_fetch_head, "FETCH_HEAD")
-GIT_PATH_FUNC(git_path_shallow, "shallow")
+REPO_GIT_PATH_FUNC(cherry_pick_head, "CHERRY_PICK_HEAD")
+REPO_GIT_PATH_FUNC(revert_head, "REVERT_HEAD")
+REPO_GIT_PATH_FUNC(squash_msg, "SQUASH_MSG")
+REPO_GIT_PATH_FUNC(merge_msg, "MERGE_MSG")
+REPO_GIT_PATH_FUNC(merge_rr, "MERGE_RR")
+REPO_GIT_PATH_FUNC(merge_mode, "MERGE_MODE")
+REPO_GIT_PATH_FUNC(merge_head, "MERGE_HEAD")
+REPO_GIT_PATH_FUNC(fetch_head, "FETCH_HEAD")
+REPO_GIT_PATH_FUNC(shallow, "shallow")

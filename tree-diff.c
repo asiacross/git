@@ -181,7 +181,7 @@ static struct combine_diff_path *emit_path(struct combine_diff_path *p,
 	struct tree_desc *t, struct tree_desc *tp,
 	int imin)
 {
-	unsigned mode;
+	unsigned short mode;
 	const char *path;
 	const struct object_id *oid;
 	int pathlen;
@@ -212,9 +212,9 @@ static struct combine_diff_path *emit_path(struct combine_diff_path *p,
 		mode = 0;
 	}
 
-	if (DIFF_OPT_TST(opt, RECURSIVE) && isdir) {
+	if (opt->flags.recursive && isdir) {
 		recurse = 1;
-		emitthis = DIFF_OPT_TST(opt, TREE_IN_RECURSIVE);
+		emitthis = opt->flags.tree_in_recursive;
 	}
 
 	if (emitthis) {
@@ -239,7 +239,7 @@ static struct combine_diff_path *emit_path(struct combine_diff_path *p,
 						DIFF_STATUS_ADDED;
 
 			if (tpi_valid) {
-				oid_i = tp[i].entry.oid;
+				oid_i = &tp[i].entry.oid;
 				mode_i = tp[i].entry.mode;
 			}
 			else {
@@ -280,7 +280,7 @@ static struct combine_diff_path *emit_path(struct combine_diff_path *p,
 			/* same rule as in emitthis */
 			int tpi_valid = tp && !(tp[i].entry.mode & S_IFXMIN_NEQ);
 
-			parents_oid[i] = tpi_valid ? tp[i].entry.oid : NULL;
+			parents_oid[i] = tpi_valid ? &tp[i].entry.oid : NULL;
 		}
 
 		strbuf_add(base, path, pathlen);
@@ -299,7 +299,8 @@ static void skip_uninteresting(struct tree_desc *t, struct strbuf *base,
 	enum interesting match;
 
 	while (t->size) {
-		match = tree_entry_interesting(&t->entry, base, 0, &opt->pathspec);
+		match = tree_entry_interesting(opt->repo->index, &t->entry,
+					       base, 0, &opt->pathspec);
 		if (match) {
 			if (match == all_entries_not_interesting)
 				t->size = 0;
@@ -421,11 +422,11 @@ static struct combine_diff_path *ll_diff_tree_paths(
 	 *   diff_tree_oid(parent, commit) )
 	 */
 	for (i = 0; i < nparent; ++i)
-		tptree[i] = fill_tree_descriptor(&tp[i], parents_oid[i]->hash);
-	ttree = fill_tree_descriptor(&t, oid->hash);
+		tptree[i] = fill_tree_descriptor(opt->repo, &tp[i], parents_oid[i]);
+	ttree = fill_tree_descriptor(opt->repo, &t, oid);
 
 	/* Enable recursion indefinitely */
-	opt->pathspec.recursive = DIFF_OPT_TST(opt, RECURSIVE);
+	opt->pathspec.recursive = opt->flags.recursive;
 
 	for (;;) {
 		int imin, cmp;
@@ -484,14 +485,14 @@ static struct combine_diff_path *ll_diff_tree_paths(
 		/* t = p[imin] */
 		if (cmp == 0) {
 			/* are either pi > p[imin] or diff(t,pi) != ø ? */
-			if (!DIFF_OPT_TST(opt, FIND_COPIES_HARDER)) {
+			if (!opt->flags.find_copies_harder) {
 				for (i = 0; i < nparent; ++i) {
 					/* p[i] > p[imin] */
 					if (tp[i].entry.mode & S_IFXMIN_NEQ)
 						continue;
 
 					/* diff(t,pi) != ø */
-					if (oidcmp(t.entry.oid, tp[i].entry.oid) ||
+					if (!oideq(&t.entry.oid, &tp[i].entry.oid) ||
 					    (t.entry.mode != tp[i].entry.mode))
 						continue;
 
@@ -522,7 +523,7 @@ static struct combine_diff_path *ll_diff_tree_paths(
 		/* t > p[imin] */
 		else {
 			/* ∀i pi=p[imin] -> D += "-p[imin]" */
-			if (!DIFF_OPT_TST(opt, FIND_COPIES_HARDER)) {
+			if (!opt->flags.find_copies_harder) {
 				for (i = 0; i < nparent; ++i)
 					if (tp[i].entry.mode & S_IFXMIN_NEQ)
 						goto skip_emit_tp;
@@ -557,9 +558,7 @@ struct combine_diff_path *diff_tree_paths(
 	 * free pre-allocated last element, if any
 	 * (see path_appendnew() for details about why)
 	 */
-	if (p->next) {
-		FREE_AND_NULL(p->next);
-	}
+	FREE_AND_NULL(p->next);
 
 	return p;
 }
@@ -607,9 +606,9 @@ static void try_to_follow_renames(const struct object_id *old_oid,
 	choice = q->queue[0];
 	q->nr = 0;
 
-	diff_setup(&diff_opts);
-	DIFF_OPT_SET(&diff_opts, RECURSIVE);
-	DIFF_OPT_SET(&diff_opts, FIND_COPIES_HARDER);
+	repo_diff_setup(opt->repo, &diff_opts);
+	diff_opts.flags.recursive = 1;
+	diff_opts.flags.find_copies_harder = 1;
 	diff_opts.output_format = DIFF_FORMAT_NO_OUTPUT;
 	diff_opts.single_follow = opt->pathspec.items[0].match;
 	diff_opts.break_opt = opt->break_opt;
@@ -706,7 +705,7 @@ int diff_tree_oid(const struct object_id *old_oid,
 	strbuf_addstr(&base, base_str);
 
 	retval = ll_diff_tree_oid(old_oid, new_oid, &base, opt);
-	if (!*base_str && DIFF_OPT_TST(opt, FOLLOW_RENAMES) && diff_might_be_rename())
+	if (!*base_str && opt->flags.follow_renames && diff_might_be_rename())
 		try_to_follow_renames(old_oid, new_oid, &base, opt);
 
 	strbuf_release(&base);

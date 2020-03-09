@@ -10,7 +10,6 @@
 #include "builtin.h"
 #include "tag.h"
 #include "run-command.h"
-#include <signal.h>
 #include "parse-options.h"
 #include "gpg-interface.h"
 #include "ref-filter.h"
@@ -58,20 +57,21 @@ int cmd_verify_tag(int argc, const char **argv, const char *prefix)
 	}
 
 	while (i < argc) {
-		unsigned char sha1[20];
+		struct object_id oid;
 		const char *name = argv[i++];
-		if (get_sha1(name, sha1)) {
+
+		if (get_oid(name, &oid)) {
 			had_error = !!error("tag '%s' not found.", name);
 			continue;
 		}
 
-		if (gpg_verify_tag(sha1, name, flags)) {
+		if (gpg_verify_tag(&oid, name, flags)) {
 			had_error = 1;
 			continue;
 		}
 
 		if (format.format)
-			pretty_print_ref(name, sha1, &format);
+			pretty_print_ref(name, &oid, &format);
 	}
 	return had_error;
 }

@@ -18,14 +18,14 @@ REM and MAKE, we must blend these two different worlds.  This script
 REM attempts to do that.
 REM ================================================================
 REM This BAT file starts in a plain (non-developer) command prompt,
-REM searches for the "best" commmand prompt setup script, installs
+REM searches for the "best" command prompt setup script, installs
 REM it into the current CMD process, and exports the various MSVC
 REM environment variables for use by MAKE.
 REM
 REM The output of this script should be written to a make "include
 REM file" and referenced by the top-level Makefile.
 REM
-REM See "config.mak.uname" (look for GIT-MSVC-GEN).
+REM See "config.mak.uname" (look for compat/vcbuild/MSVC-DEFS-GEN).
 REM ================================================================
 REM The provided command prompts are custom to each VS release and
 REM filled with lots of internal knowledge (such as Registry settings);
@@ -53,7 +53,7 @@ REM Visual Studio 2015 uses the traditional VcVarsAll.
 REM
 REM Earlier Versions
 REM ----------------
-REM TODO
+REM Currently unsupported.
 REM
 REM ================================================================
 REM Note: Throughout this script we use "dir <path> && <cmd>" rather
@@ -142,8 +142,7 @@ REM ================================================================
 REM ================================================================
 
 :not_2015
-   REM TODO....
-   echo TODO support older versions of VS. >&2
+   echo "ERROR: unsupported VS version (older than VS2015)" >&2
    EXIT /B 1
 
 REM ================================================================
@@ -154,7 +153,9 @@ REM ================================================================
    REM Include DOS-style and BASH-style path for bin dir.
 
    echo msvc_bin_dir=%msvc_bin_dir%
-   echo msvc_bin_dir_msys=%msvc_bin_dir:C:=/C%
+   SET X1=%msvc_bin_dir:C:=/C%
+   SET X2=%X1:\=/%
+   echo msvc_bin_dir_msys=%X2%
 
    echo msvc_includes=%msvc_includes%
    echo msvc_libs=%msvc_libs%

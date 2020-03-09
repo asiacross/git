@@ -95,6 +95,9 @@ char *strbuf_realpath(struct strbuf *resolved, const char *path,
 			goto error_out;
 	}
 
+	if (platform_strbuf_realpath(resolved, path))
+		return resolved->buf;
+
 	strbuf_addstr(&remaining, path);
 	get_root_part(resolved, &remaining);
 
@@ -202,6 +205,10 @@ error_out:
 	return retval;
 }
 
+/*
+ * Resolve `path` into an absolute, cleaned-up path. The return value
+ * comes from a shared buffer.
+ */
 const char *real_path(const char *path)
 {
 	static struct strbuf realpath = STRBUF_INIT;

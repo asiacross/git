@@ -5,8 +5,6 @@
 #include "unix-socket.h"
 #include "parse-options.h"
 
-static struct tempfile socket_file;
-
 struct credential_cache_entry {
 	struct credential item;
 	timestamp_t expiration;
@@ -93,7 +91,8 @@ static timestamp_t check_expirations(void)
 }
 
 static int read_request(FILE *fh, struct credential *c,
-			struct strbuf *action, int *timeout) {
+			struct strbuf *action, int *timeout)
+{
 	static struct strbuf item = STRBUF_INIT;
 	const char *p;
 
@@ -260,6 +259,7 @@ static void init_socket_directory(const char *path)
 
 int cmd_main(int argc, const char **argv)
 {
+	struct tempfile *socket_file;
 	const char *socket_path;
 	int ignore_sighup = 0;
 	static const char *usage[] = {
@@ -285,7 +285,7 @@ int cmd_main(int argc, const char **argv)
 		die("socket directory must be an absolute path");
 
 	init_socket_directory(socket_path);
-	register_tempfile(&socket_file, socket_path);
+	socket_file = register_tempfile(socket_path);
 
 	if (ignore_sighup)
 		signal(SIGHUP, SIG_IGN);

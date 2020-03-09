@@ -1,9 +1,10 @@
 #include "cache.h"
 #include "refs.h"
 #include "remote.h"
+#include "object-store.h"
 #include "strbuf.h"
 #include "url.h"
-#include "exec_cmd.h"
+#include "exec-cmd.h"
 #include "run-command.h"
 #include "vcs-svn/svndump.h"
 #include "notes.h"
@@ -61,7 +62,7 @@ static char *read_ref_note(const struct object_id *oid)
 	init_notes(NULL, notes_ref, NULL, 0);
 	if (!(note_oid = get_note(NULL, oid)))
 		return NULL;	/* note tree not found */
-	if (!(msg = read_sha1_file(note_oid->hash, &type, &msglen)))
+	if (!(msg = read_object_file(note_oid, &type, &msglen)))
 		error("Empty notes tree. %s", notes_ref);
 	else if (!msglen || type != OBJ_BLOB) {
 		error("Note contains unusable content. "
@@ -108,7 +109,7 @@ static int note2mark_cb(const struct object_id *object_oid,
 	enum object_type type;
 	struct rev_note note;
 
-	if (!(msg = read_sha1_file(note_oid->hash, &type, &msglen)) ||
+	if (!(msg = read_object_file(note_oid, &type, &msglen)) ||
 			!msglen || type != OBJ_BLOB) {
 		free(msg);
 		return 1;
@@ -174,7 +175,7 @@ static int cmd_import(const char *line)
 	struct child_process svndump_proc = CHILD_PROCESS_INIT;
 	const char *command = "svnrdump";
 
-	if (read_ref(private_ref, head_oid.hash))
+	if (read_ref(private_ref, &head_oid))
 		startrev = 0;
 	else {
 		note_msg = read_ref_note(&head_oid);
